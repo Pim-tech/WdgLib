@@ -1,0 +1,720 @@
+
+Patchwork
+Linux Kernel Mailing List
+
+    Patches
+    Bundles
+    About this project
+
+    Login
+    Register
+    Mail settings
+
+[v2,0/4] have the vt console preserve unicode characters
+Message ID  20180617190706.14614-1-nicolas.pitre@linaro.org
+Headers  show
+Series  
+
+    have the vt console preserve unicode characters
+
+Related  show
+Message
+Nicolas Pitre June 17, 2018, 7:07 p.m. UTC
+
+The vt code translates UTF-8 strings into glyph index values and stores
+those glyph values directly in the screen buffer. Because there can only
+be at most 512 glyphs, it is impossible to represent most unicode
+characters, in which case a default glyph (often '?') is displayed
+instead. The original unicode value is then lost.
+
+This also means that the /dev/vcs* devices only provide user space with
+glyph index values, and then user applications must get hold of the
+unicode-to-glyph table the kernel is using in order to back-translate
+those into actual characters. It is not possible to get back the original
+unicode value when multiple unicode characters map to the same glyph,
+especially for the vast majority that maps to the default replacement
+glyph.
+
+The 512-glyph limitation is inherent to VGA displays, but users of
+/dev/vcs* shouldn't have to be restricted to a narrow unicode space from
+lossy screen content because of that. This is especially true for
+accessibility applications such as BRLTTY that rely on /dev/vcs to rander
+screen content onto braille terminals.
+
+This patch series introduces unicode support to /dev/vcs* devices,
+allowing full unicode access from userspace to the vt console which
+can, amongst other purposes, appropriately translate actual unicode
+screen content into braille. Memory is allocated, and possible CPU
+overhead introduced, only if /dev/vcsu is read at least once.
+
+I'm a prime user of this feature, as well as the BRLTTY maintainer Dave Mielke
+who implemented support for this in BRLTTY. There is therefore a vested
+interest in maintaining this feature as necessary. And this received
+extensive testing as well at this point.
+
+Patch #4 was used for validation and is included for completeness, however
+if people think it is unappropriate for mainline then it can be dropped.
+
+This is also available on top of v4.18-rc1 here:
+
+  git://git.linaro.org/people/nicolas.pitre/linux vt-unicode
+
+Changes from v1:
+
+- Rebased to v4.18-rc1.
+- Dropped first patch (now in mainline as commit 4b4ecd9cb8).
+- Removed a printk instance from an error path easily triggerable
+  from user space.
+- Minor cleanup.
+
+Diffstat:
+
+ drivers/tty/vt/vc_screen.c     |  90 +++++++--
+ drivers/tty/vt/vt.c            | 347 +++++++++++++++++++++++++++++++++--
+ include/linux/console_struct.h |   2 +
+ include/linux/selection.h      |   5 +
+ 4 files changed, 419 insertions(+), 25 deletions(-)
+
+Comments
+Nicolas Pitre June 19, 2018, 12:14 p.m. UTC | #1
+
+On Mon, 18 Jun 2018, Joe Perches wrote:
+
+> On Mon, 2018-06-18 at 21:50 -0400, Nicolas Pitre wrote:
+> > On Tue, 19 Jun 2018, Andy Shevchenko wrote:
+> []
+> > > > +       /*
+> > > > +        * Make sure our unicode screen translates into the same glyphs
+> > > > +        * as the actual screen. This is brutal indeed.
+> > > > +        */
+> > > > +       p = (unsigned short *)vc->vc_origin;
+> > > > +       mask = vc->vc_hi_font_mask | 0xff;
+> > > > +       for (y = 0; y < vc->vc_rows; y++) {
+> > > > +               char32_t *line = uniscr->lines[y];
+> > > > +               for (x = 0; x < vc->vc_cols; x++) {
+> > > > +                       u16 glyph = scr_readw(p++) & mask;
+> > > > +                       char32_t uc = line[x];
+> > > > +                       int tc = conv_uni_to_pc(vc, uc);
+> > > > +                       if (tc == -4)
+> > > > +                               tc = conv_uni_to_pc(vc, 0xfffd);
+> > > > +                       if (tc == -4)
+> > > > +                               tc = conv_uni_to_pc(vc, '?');
+> > > > +                       if (tc != glyph)
+> > > > +                               pr_notice("%s: mismatch at %d,%d: "
+> > > > +                                         "glyph=%#x tc=%#x\n", __func__,
+> > > > +                                         x, y, glyph, tc);
+> > > 
+> > > Don't split format string in printk(). checkpatch will not warn on longer lines.
+> > 
+> > I didn't do it like that for checkpatch but to keep the code readable.
+> > I don't particularly care either ways though.
+> 
+> If one glyph is off, then perhaps others are off too.
+> Perhaps this message should be ratelimited.
+
+Remember that this is costly debugging code that is off by default. 
+No production kernel should have it enabled.
+
+
+Nicolas
+
+Adam Borowski June 19, 2018, 1:09 p.m. UTC | #2
+
+On Sun, Jun 17, 2018 at 03:07:02PM -0400, Nicolas Pitre wrote:
+> The vt code translates UTF-8 strings into glyph index values and stores
+> those glyph values directly in the screen buffer. Because there can only
+> be at most 512 glyphs, it is impossible to represent most unicode
+> characters, in which case a default glyph (often '?') is displayed
+> instead. The original unicode value is then lost.
+> 
+> The 512-glyph limitation is inherent to VGA displays, but users of
+> /dev/vcs* shouldn't have to be restricted to a narrow unicode space from
+> lossy screen content because of that. This is especially true for
+> accessibility applications such as BRLTTY that rely on /dev/vcs to rander
+> screen content onto braille terminals.
+
+You're thinking small.  That 256 possible values for Braille are easily
+encodable within the 512-glyph space (256 char + stolen fg brightness bit,
+another CGA peculiarity).  Your patchset, though, can be used for proper
+Unicode support for the rest of us.
+
+The 256/512 value limitation applies only to CGA-compatible hardware; these
+days this means vgacon.  But most people use other drivers.  Nouveau forces
+graphical console, on arm* there's no such thing as VGA[1], etc.
+
+Thus, it'd be nice to use the structure you add to implement full Unicode
+range for the vast majority of people.  This includes even U+2800..FF.  :)
+
+> This patch series introduces unicode support to /dev/vcs* devices,
+> allowing full unicode access from userspace to the vt console which
+> can, amongst other purposes, appropriately translate actual unicode
+> screen content into braille. Memory is allocated, and possible CPU
+> overhead introduced, only if /dev/vcsu is read at least once.
+
+What about doing so if any updated console driver is loaded?  Possibly, once
+the vt in question has been switched to (>99% people never see anything but
+tty1 during boot-up, all others showing nothing but getty).  Or perhaps the
+moment any non-ASCII character is output to the given vt.
+
+If memory usage is a concern, it's possible to drop the old structure and
+convert back only in the rare case the driver is unloaded; reads of old-
+style /dev/vc{s,sa}\d* are not speed-critical thus can use conversion on the
+fuly.  Unicode takes only 21 bits out of 32 you allocate, that's plenty of
+space for attributes: they currently take 8 bits; naive way gives us free 3
+bits that could be used for additional attributes.
+
+Especially underline is in common use these days; efficient support for CJK
+would also use one bit to mark left/right half.  And it's decades overdue to
+drop blink, which is not even supported by anything but vgacon anyway!
+(Graphical drivers tend to show this bit as bright background, but don't
+accept SGR codes other thank blink[2].)
+
+> I'm a prime user of this feature, as well as the BRLTTY maintainer Dave Mielke
+> who implemented support for this in BRLTTY. There is therefore a vested
+> interest in maintaining this feature as necessary. And this received
+> extensive testing as well at this point.
+
+So, you care only about people with faulty wetware.  Thus, it sounds like
+work that benefits sighted people would need to be done by people other than
+you.  So I'm only mentioning possible changes; they could possibly go after
+your patchset goes in:
+
+A) if memory is considered to be at premium, what about storing only one
+   32-bit value, masked 21 bits char 11 bits attr?  On non-vgacon, there's
+   no reason to keep the old structures.
+B) if being this frugal wrt memory is ridiculous today, what about instead
+   going for 32 bits char (wasteful) 32 bits attr?  This would be much nicer
+   15 bit fg color + 15 bit bg color + underline + CJK or something.
+You already triple memory use; variant A) above would reduce that to 2x,
+variant B) to 4x.
+
+Considering that modern machines can draw complex scenes of several
+megapixels 60 times a second, it could be reasonable to drop the complexity
+of two structures even on vgacon: converting characters on the fly during vt
+switch is beyond notice on any hardware Linux can run.
+
+> This is also available on top of v4.18-rc1 here:
+> 
+>   git://git.linaro.org/people/nicolas.pitre/linux vt-unicode
+
+
+
+Meow!
+
+[1]. config VGA_CONSOLE
+  depends on !4xx && !PPC_8xx && !SPARC && !M68K && !PARISC &&  !SUPERH && \
+          (!ARM || ARCH_FOOTBRIDGE || ARCH_INTEGRATOR || ARCH_NETWINDER) && \
+          !ARM64 && !ARC && !MICROBLAZE && !OPENRISC && !NDS32 && !S390
+
+[2]. Sounds like an easy improvement; not so long ago I added "\e[48;5;m",
+"\e[48;2;m" and "\e[100m" which could be improved when on unblinking drivers.
+Heck, even VGA can be switched to unblinking by flipping bit 3 of the
+Attribute Mode Control Register -- like we already flip foreground
+brightness when 512 glyphs are needed.
+
+Adam Borowski June 19, 2018, 3:14 p.m. UTC | #3
+
+On Tue, Jun 19, 2018 at 09:52:13AM -0400, Dave Mielke wrote:
+> [quoted lines by Adam Borowski on 2018/06/19 at 15:09 +0200]
+> 
+> >You're thinking small.  That 256 possible values for Braille are easily
+> >encodable within the 512-glyph space (256 char + stolen fg brightness bit,
+> >another CGA peculiarity).  
+> 
+> Not at all. We braille users, especially when working with languages other than
+> English, need more than 256 non-braille characters. Even for those who can live
+> with just 256 non-braille characters, it's still a major pain having to come up
+> with a usable braille-capable font for every needed 256 non-braille characters
+> set. I can assure you, as an actual braille user, that the limitation has been
+> a very long-standing problem and it's a great relief that it's finally been
+> resolved.
+
+Ok, I thought Braille is limited to 2x3 dots, recently extended to 2x4;
+thanks for the explanation!
+
+But those of us who are sighted, are greatly annoyed by characters that are
+usually taken for granted being randomly missing.  For example, no console
+font+mapping shipped with Debian supports ░▒▓▄▀ (despite them being a
+commonly used part of the BIOS charset), so unless you go out of your way to
+beat them back they'll be corrupted (usually into ♦).  Then Perl6 wants ｢｣⚛,
+and so on.  All these problems would instantly disappear the moment console
+sheds the limit of 256/512 glyphs.
+
+So I'm pretty happy seeing this patch set.
+
+
+Meow!
+
+Nicolas Pitre June 19, 2018, 3:34 p.m. UTC | #4
+
+On Tue, 19 Jun 2018, Adam Borowski wrote:
+
+> On Sun, Jun 17, 2018 at 03:07:02PM -0400, Nicolas Pitre wrote:
+> > The vt code translates UTF-8 strings into glyph index values and stores
+> > those glyph values directly in the screen buffer. Because there can only
+> > be at most 512 glyphs, it is impossible to represent most unicode
+> > characters, in which case a default glyph (often '?') is displayed
+> > instead. The original unicode value is then lost.
+> > 
+> > The 512-glyph limitation is inherent to VGA displays, but users of
+> > /dev/vcs* shouldn't have to be restricted to a narrow unicode space from
+> > lossy screen content because of that. This is especially true for
+> > accessibility applications such as BRLTTY that rely on /dev/vcs to rander
+> > screen content onto braille terminals.
+> 
+> You're thinking small.  That 256 possible values for Braille are easily
+> encodable within the 512-glyph space (256 char + stolen fg brightness bit,
+> another CGA peculiarity). 
+
+Braille is not just about 256 possible patterns. It is often the case 
+that a single print character is transcoded into a sequence of braille 
+characters given that there is more than 256 possible print characters. 
+And there are different transcoding rules for different languages, and 
+even different rules across different countries with the same language. 
+This may get complicated very quickly and you really don't want that 
+processing to live in the kernel.
+
+The point is not to have a font that displays braille but to let user 
+space access the actual unicode character that corresponds to a given 
+screen position.
+
+> Your patchset, though, can be used for proper
+> Unicode support for the rest of us.
+
+Absolutely. I think it is generic enough so that display drivers that 
+would benefit from it may do so already. My patchset introduces one 
+user: vc_screen. The selection code could be yet another easy convert. 
+Beyond that it is a matter of extending the kernel interface for larger 
+font definitions, etc. But being sight impaired myself I won't play with 
+actual display driver code.
+
+> The 256/512 value limitation applies only to CGA-compatible hardware; these
+> days this means vgacon.  But most people use other drivers.  Nouveau forces
+> graphical console, on arm* there's no such thing as VGA[1], etc.
+
+I do agree with you.
+
+> Thus, it'd be nice to use the structure you add to implement full Unicode
+> range for the vast majority of people.  This includes even U+2800..FF.  :)
+
+Be my guest if you want to use this structure. As for U+2800..FF, like I 
+said earlier, this is not what most people use when communicating, so it 
+is of little interest even to blind users except for displaying native 
+braille documents, or showing off. ;-)
+
+> > This patch series introduces unicode support to /dev/vcs* devices,
+> > allowing full unicode access from userspace to the vt console which
+> > can, amongst other purposes, appropriately translate actual unicode
+> > screen content into braille. Memory is allocated, and possible CPU
+> > overhead introduced, only if /dev/vcsu is read at least once.
+> 
+> What about doing so if any updated console driver is loaded?  Possibly, once
+> the vt in question has been switched to (>99% people never see anything but
+> tty1 during boot-up, all others showing nothing but getty).  Or perhaps the
+> moment any non-ASCII character is output to the given vt.
+
+Right now it is activated only when an actual user manifests itself. I 
+think this is the right thing to do. If an updated console driver is 
+loaded then it will activate unicode handling right away as you say.
+
+> If memory usage is a concern, it's possible to drop the old structure and
+> convert back only in the rare case the driver is unloaded; reads of old-
+> style /dev/vc{s,sa}\d* are not speed-critical thus can use conversion on the
+> fuly.  Unicode takes only 21 bits out of 32 you allocate, that's plenty of
+> space for attributes: they currently take 8 bits; naive way gives us free 3
+> bits that could be used for additional attributes.
+
+If the core console code makes the switch to full unicode then yes, that 
+would be the way to go to maintain backward compatibility. However 
+vgacon users would see a performance drop when switching between VT's 
+and we used to brag about how fast the Linux console used to be 20 years 
+ago. Does it still matter today?
+
+> > I'm a prime user of this feature, as well as the BRLTTY maintainer Dave Mielke
+> > who implemented support for this in BRLTTY. There is therefore a vested
+> > interest in maintaining this feature as necessary. And this received
+> > extensive testing as well at this point.
+> 
+> So, you care only about people with faulty wetware.  Thus, it sounds like
+> work that benefits sighted people would need to be done by people other than
+> you. 
+
+Hard for me to contribute more if I can't enjoy the result.
+
+> So I'm only mentioning possible changes; they could possibly go after
+> your patchset goes in:
+> 
+> A) if memory is considered to be at premium, what about storing only one
+>    32-bit value, masked 21 bits char 11 bits attr?  On non-vgacon, there's
+>    no reason to keep the old structures.
+
+Absolutely. As soon as vgacon is officially relegated to second class 
+citizen i.e. perform the glyph translation each time it requires 
+a refresh instead of dictating how the core console code works then the 
+central glyph buffer can go.
+
+> B) if being this frugal wrt memory is ridiculous today, what about instead
+>    going for 32 bits char (wasteful) 32 bits attr?  This would be much nicer
+>    15 bit fg color + 15 bit bg color + underline + CJK or something.
+> You already triple memory use; variant A) above would reduce that to 2x,
+> variant B) to 4x.
+> 
+> Considering that modern machines can draw complex scenes of several
+> megapixels 60 times a second, it could be reasonable to drop the complexity
+> of two structures even on vgacon: converting characters on the fly during vt
+> switch is beyond notice on any hardware Linux can run.
+
+You certainly won't find any objections from me.
+
+In the mean time, both systems may work in parallel for a smooth 
+transition.
+
+
+Nicolas
+
+Adam Borowski June 21, 2018, 1:43 a.m. UTC | #5
+
+On Tue, Jun 19, 2018 at 11:34:34AM -0400, Nicolas Pitre wrote:
+> On Tue, 19 Jun 2018, Adam Borowski wrote:
+> > Thus, it'd be nice to use the structure you add to implement full Unicode
+> > range for the vast majority of people.  This includes even U+2800..FF.  :)
+> 
+> Be my guest if you want to use this structure. As for U+2800..FF, like I 
+> said earlier, this is not what most people use when communicating, so it 
+> is of little interest even to blind users except for displaying native 
+> braille documents, or showing off. ;-)
+
+It's meant for displaying braille to _sighted_ people.  And in real world,
+the main [ab]use is a way to show images that won't get corrupted by
+proportional fonts. :-þ
+
+> If the core console code makes the switch to full unicode then yes, that 
+> would be the way to go to maintain backward compatibility. However 
+> vgacon users would see a performance drop when switching between VT's 
+> and we used to brag about how fast the Linux console used to be 20 years 
+> ago. Does it still matter today?
+
+I've seen this slowness.  A long time ago, on a server that someone gave an
+_ISA_ graphics card (it was an old machine, and it was 1.5 decades ago). 
+Indeed, switching VTs took around a second.  But this was drawing speed, not
+Unicode conversion.
+
+There are three cases when a character can enter the screen:
+* being printed by the tty.  This is the only case not sharply rate-limited.
+  It already has to do the conversion.  If we eliminate the old struct, it
+  might even be a speed-up when lots of text gets blasted to a non-active
+  VT.
+* VT switch
+* scrollback
+
+The last two cases are initiated by the user, and within human reaction time
+you need to convert usually 2000 -- up to 20k-ish -- characters.  The
+conversion is done by a 3-level array.  I think a ZX Spectrum can handle
+this fine without a visible slowdown.
+
+> > > I'm a prime user of this feature, as well as the BRLTTY maintainer Dave Mielke
+> > > who implemented support for this in BRLTTY. There is therefore a vested
+> > > interest in maintaining this feature as necessary. And this received
+> > > extensive testing as well at this point.
+> > 
+> > So, you care only about people with faulty wetware.  Thus, it sounds like
+> > work that benefits sighted people would need to be done by people other than
+> > you. 
+> 
+> Hard for me to contribute more if I can't enjoy the result.
+
+Obviously.
+
+The primary users would be:
+* people who want symbols uncorrupted (especially if their language uses a
+  non-latin script)
+* CJK people (as discussed below)
+
+It could also simplify the life for distros -- less required configuration:
+a single font needed for currently supported charsets together has mere
+~1000 glyphs, at 8x16 that's 16000 bytes (+ mapping).  Obviously for CJK
+that's more.
+ 
+> > So I'm only mentioning possible changes; they could possibly go after
+> > your patchset goes in:
+> > 
+> > A) if memory is considered to be at premium, what about storing only one
+> >    32-bit value, masked 21 bits char 11 bits attr?  On non-vgacon, there's
+> >    no reason to keep the old structures.
+> 
+> Absolutely. As soon as vgacon is officially relegated to second class 
+> citizen i.e. perform the glyph translation each time it requires 
+> a refresh instead of dictating how the core console code works then the 
+> central glyph buffer can go.
+
+Per the analysis above, on-the-fly translation is so unobtrusive that it
+shouldn't be a problem.
+
+> > B) if being this frugal wrt memory is ridiculous today, what about instead
+> >    going for 32 bits char (wasteful) 32 bits attr?  This would be much nicer
+> >    15 bit fg color + 15 bit bg color + underline + CJK or something.
+> > You already triple memory use; variant A) above would reduce that to 2x,
+> > variant B) to 4x.
+> 
+> You certainly won't find any objections from me.
+
+Right, let's see if your patchset gets okayed before building atop it.
+ 
+> In the mean time, both systems may work in parallel for a smooth 
+> transition.
+
+Sounds like a good idea.
+
+
+WRT support for fonts >512 glyphs: I talked to a Chinese hacker (log
+starting at 15:32 on https://irclog.whitequark.org/linux-sunxi/2018-06-19),
+she said there are multiple popular non-mainline patchsets implementing CJK
+on console.  None of them got accepted because of pretty bad code like
+https://github.com/Gentoo-zh/linux-cjktty/commit/b6160f85ef5bc5c2cae460f6c0a1aba3e417464f
+but getting this done cleanly would require just:
+* your patchset here
+* console driver using the Unicode structure
+* loading such larger fonts (the one in cjktty is built-in)
+* double-width characters in vt.c
+
+
+Meow!
+
+Adam Borowski June 22, 2018, 1:54 a.m. UTC | #6
+
+On Wed, Jun 20, 2018 at 10:21:37PM -0400, Dave Mielke wrote:
+> [quoted lines by Adam Borowski on 2018/06/21 at 03:43 +0200]
+> 
+> >It's meant for displaying braille to _sighted_ people.  And in real world,
+> >the main [ab]use is a way to show images that won't get corrupted by
+> >proportional fonts. :-þ
+> 
+> It's not abuse at all. I often use U+28xx to show sighted people what the
+> braille for something looks like. I often need to do this when, for example, I
+> need them to comapre what I'm showing them to what's on an actual braille
+> display. U+28xx is the only way for me to do this without a lengthy description
+> containing sequences of dot number combinations.
+
+What you describe is the intended use.  Abuse is when people use these
+glyphs to write text like this:
+
+⡎⠉⠂⠠⠤⡀⣄⠤⡀⠀⠀⠀⡄⠀⡄⡠⠤⡀⡄⠀⡄⠀⠀⠀⣄⠤⡀⡠⠤⡀⠠⠤⡀⡠⠤⡇⠀⠀⠀⠤⡧⠄⣇⠤⡀⠠⡅⠀⡠⠤⠄⠎⢉⠆
+⠣⠤⠂⠪⠭⠇⠇⠀⠇⠀⠀⠀⠨⠭⠃⠣⠤⠃⠣⠤⠃⠀⠀⠀⠇⠀⠀⠫⠭⠁⠪⠭⠇⠣⠤⠇⠀⠀⠀⠀⠣⠄⠇⠀⠇⠀⠣⠀⠬⠭⠂⠀⠅⠀
+
+(Not sure if you're completely blind or merely very weakly sighted; if the
+former, this is my way to show you how actual Latin letters look like,
+without a lengthy description of letter shapes. :) )
+
+or for graphs.  Here's commits per UTC hour of day:
+
+⡀⠀⠀⢀⣴⣤⣴⣶⣶⣶⣾⣦
+⣿⣷⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿
+
+git log --pretty=format:'%at'|
+perl -pe 'use integer;/^(\d+)$/ or die;$_=$1/3600%24 ."\n"'|
+sort -n|uniq -c|cut -c3-7|braillegraph -y 8
+
+or arbitrary images, like my .sig in all my mails in this thread.
+
+But your patch set doesn't special-case braille in any way, thus allowing
+such abuse to work on the console is merely an unintended side effect.
+
+> >The primary users would be:
+> >* people who want symbols uncorrupted (especially if their language uses a
+> >  non-latin script)
+> >* CJK people (as discussed below)
+> 
+> Again, that's not true. Why aren't braille users included in this list? After
+> all, it's we who motivated this enhancement. I guess actual blind people
+> mustn't count just because there are relatively fewer of us. :-(
+
+Well, I meant users of Unicode display fonts, ie, _additional_ functionality
+that's not yet coded but would rely on this patchset.  What you guys want is
+already included.
+
+The reason I'm raising this issue now is because if the Unicode struct would
+be the primary one, there's no point in keeping vc_data in addition to
+uni_screen.  And that would require designing the struct well from the
+start, to avoid unnecessary changes in the future.
+
+But then, taking a bitmask from that 32-bit value wouldn't be a big change
+-- you already take variously 8 or 9 bits out of a 16-bit field, depending
+on 256 vs 512 glyph mode.
+
+The other point is a quite pointless assumption that existing scrollback is
+"optimized".  Even vgacon mostly uses software scrollback these days, as the
+amount of VGA display memory is really small.
+
+I don't know much about console display drivers in general, though, and it
+looks like most of them are unmaintained (just noticed that sisusb for
+example hasn't seen a maintainer action for 13 years, and that person's
+domain expired in 2006).
+
+
+Meow!
+
+Samuel Thibault June 22, 2018, 6:41 a.m. UTC | #7
+
+Adam Borowski, le ven. 22 juin 2018 03:54:45 +0200, a ecrit:
+> if the former, this is my way to show you how actual Latin letters
+> look like, without a lengthy description of letter shapes. :) )
+
+What will unfortunately not work: braille displays only show one line at
+a time, so they can't show the global shape of a figure, unless it is
+only 4pixels tall.
+
+Samuel
+
+Alan Cox June 22, 2018, 3:59 p.m. UTC | #8
+
+> The other point is a quite pointless assumption that existing scrollback is
+> "optimized".  Even vgacon mostly uses software scrollback these days, as the
+> amount of VGA display memory is really small.
+
+All of our console driver code is horribly unoptimized for most of
+todays hardware. Long ago I did look at what was needed but it's a
+seriously non-trivial change. In particular
+
+- Console I/O occurs under enough locks to keep fort knox safe. That
+  means it's very very hard to accelerate
+
+- The logic is plain wrong for a lot of modern video. We shouldn't be
+  scrolling, we should be rendering the current backing text buffer at
+  video refresh rate or similar and if the source of the updates outruns
+  us it doesn't matter - we don't have to draw all the glyphs as if we
+  were fast enough they would have been a blur anyway.
+ 
+> I don't know much about console display drivers in general, though, and it
+> looks like most of them are unmaintained (just noticed that sisusb for
+> example hasn't seen a maintainer action for 13 years, and that person's
+> domain expired in 2006).
+
+There has been some work on them but they are not in a good state, and as
+a result we have problems like these as well as the inability to nicely
+support multi-console systems except in Wayland/X.
+
+Alan
+
+Nicolas Pitre June 22, 2018, 4:28 p.m. UTC | #9
+
+On Fri, 22 Jun 2018, Alan Cox wrote:
+
+> > The other point is a quite pointless assumption that existing scrollback is
+> > "optimized".  Even vgacon mostly uses software scrollback these days, as the
+> > amount of VGA display memory is really small.
+> 
+> All of our console driver code is horribly unoptimized for most of
+> todays hardware. Long ago I did look at what was needed but it's a
+> seriously non-trivial change. In particular
+> 
+> - Console I/O occurs under enough locks to keep fort knox safe. That
+>   means it's very very hard to accelerate
+> 
+> - The logic is plain wrong for a lot of modern video. We shouldn't be
+>   scrolling, we should be rendering the current backing text buffer at
+>   video refresh rate or similar and if the source of the updates outruns
+>   us it doesn't matter - we don't have to draw all the glyphs as if we
+>   were fast enough they would have been a blur anyway.
+
+My executive summary from what you say is that there is no longer an 
+advantage to maintain a central vga-style glyph buffer in the core 
+console code, right?
+
+
+Nicolas
+
+Alan Cox June 22, 2018, 5:51 p.m. UTC | #10
+
+On Fri, 22 Jun 2018 12:28:17 -0400 (EDT)
+Nicolas Pitre <nicolas.pitre@linaro.org> wrote:
+
+> On Fri, 22 Jun 2018, Alan Cox wrote:
+> 
+> > > The other point is a quite pointless assumption that existing scrollback is
+> > > "optimized".  Even vgacon mostly uses software scrollback these days, as the
+> > > amount of VGA display memory is really small.  
+> > 
+> > All of our console driver code is horribly unoptimized for most of
+> > todays hardware. Long ago I did look at what was needed but it's a
+> > seriously non-trivial change. In particular
+> > 
+> > - Console I/O occurs under enough locks to keep fort knox safe. That
+> >   means it's very very hard to accelerate
+> > 
+> > - The logic is plain wrong for a lot of modern video. We shouldn't be
+> >   scrolling, we should be rendering the current backing text buffer at
+> >   video refresh rate or similar and if the source of the updates outruns
+> >   us it doesn't matter - we don't have to draw all the glyphs as if we
+> >   were fast enough they would have been a blur anyway.  
+> 
+> My executive summary from what you say is that there is no longer an 
+> advantage to maintain a central vga-style glyph buffer in the core 
+> console code, right?
+
+Yeah. The only driver that it suits is the VGA text mode driver, which at
+2GHz+ is going to be fast enough whatever format you convert from. We
+have the memory, the processor power and the fact almost all our displays
+are bitmapped (or more complex still) all in favour of throwing away that
+limit.
+
+Alan
+
+Adam Borowski June 25, 2018, 12:33 a.m. UTC | #11
+
+On Wed, Jun 20, 2018 at 10:59:08PM -0400, Nicolas Pitre wrote:
+> On Thu, 21 Jun 2018, Adam Borowski wrote:
+> 
+> > On Tue, Jun 19, 2018 at 11:34:34AM -0400, Nicolas Pitre wrote:
+> > > On Tue, 19 Jun 2018, Adam Borowski wrote:
+> > > > Thus, it'd be nice to use the structure you add to implement full Unicode
+> > > > range for the vast majority of people.  This includes even U+2800..FF.  :)
+
+> > > If the core console code makes the switch to full unicode then yes, that 
+> > > would be the way to go to maintain backward compatibility. However 
+> > > vgacon users would see a performance drop when switching between VT's 
+> > > and we used to brag about how fast the Linux console used to be 20 years 
+> > > ago. Does it still matter today?
+> 
+> > * VT switch
+> > * scrollback
+> > 
+> > The last two cases are initiated by the user, and within human reaction time
+> > you need to convert usually 2000 -- up to 20k-ish -- characters.  The
+> > conversion is done by a 3-level array.  I think a ZX Spectrum can handle
+> > this fine without a visible slowdown.
+> 
+> In the scrollback case, currently each driver is doing its own thing. 
+> The vgacon driver is probably the most efficient as it only moves the 
+> base memory register around without copying anything at all. And that 
+> part doesn't have to change.
+
+As long as the data is still in video memory, yeah.  Soft scrollback is not
+yet the default, because some userspace tools assume vt switch clears
+scrollback and do so for security reasons.  All known tools that do so have
+been fixed (at least in Debian), but as you can run new kernels with
+arbitrarily old userspace, it's better to wait a bit longer before switching
+to something effectively identical to soft scrollback.  Failure mode: after
+logout, you can scroll back to the supposedly cleared content of the old
+session.
+
+Your code avoids this, at the cost of losing data about anything
+representable by the currently loaded charset for anything inside
+scrollback.
+
+But in the near future, it'd be good to have soft scrollback work the same
+for all drivers.
+
+> > Right, let's see if your patchset gets okayed before building atop it.
+> 
+> May I add your ACK to it?
+
+I don't believe I'm knowledgeful nor active enough in this part for my ACKs
+to be meaningful.  On the other hand, I've analyzed your patchset long
+enough to see no problems with it, thus if you have an use for my tags, then
+sure, you have my ACK.
+
+
+Meow!
+
+patchwork patch tracking system | version | about patchwork
+
