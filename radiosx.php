@@ -8,7 +8,7 @@ spl_autoload_register(function($className) {
     include __DIR__ . '/' . str_replace('\\','/',$className)  . '.php';
 });
 include 'lib/widgets/Cadre.php';
-$handle = opendir('/home/moi/radio_direct');
+$handle = opendir('./radio_direct');
 $text = array();
 while( false != ($entry = readdir($handle))){
     if ( '.m3u' === substr($entry,-4)){
